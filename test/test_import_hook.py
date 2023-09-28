@@ -38,6 +38,33 @@ def test_import_hook_typeguard():
         from . import import_hook_tester_typeguard  # noqa: F401
 
 
+def test_import_hook_beartype_with_function_typechecker():
+    def f(x, *args, **kwargs):
+        import beartype
+
+        return beartype.beartype(x, *args, **kwargs)
+
+    hook = install_import_hook("test.import_hook_tester_beartype_full", f)
+    with hook:
+        from . import import_hook_tester_beartype_full  # noqa: F401
+
+
+def test_import_hook_typeguard_with_import():
+    hook = install_import_hook(
+        "test.import_hook_tester_typeguard_with_import", "typeguard.typechecked"
+    )
+    with hook:
+        from . import import_hook_tester_typeguard_with_import  # noqa: F401
+
+
+def test_import_hook_beartype_with_import():
+    hook = install_import_hook(
+        "test.import_hook_tester_beartype_with_import", "beartype.beartype"
+    )
+    with hook:
+        from . import import_hook_tester_beartype_with_import  # noqa: F401
+
+
 def test_import_hook_beartype_old():
     try:
         import beartype  # noqa: F401

@@ -57,7 +57,7 @@ from collections.abc import Sequence
 from importlib.abc import MetaPathFinder
 from importlib.machinery import SourceFileLoader
 from importlib.util import cache_from_source, decode_source
-from inspect import isclass
+from inspect import getsource, isclass
 from typing import Optional, Union
 from unittest.mock import patch
 
@@ -76,8 +76,10 @@ def _optimized_cache_from_source(typechecker_hash, /, path, debug_override=None)
     # Version 5: Added support for string-based `typechecker` argument.
     # Version 6: optimization tag now depends on `typechecker` argument, so that
     #    changing the typechecker will hit a different cache.
+    # Version 7: Now allowing to pass functions as a typechecker, using md5 hash of the
+    #    source code as the hash.
     return cache_from_source(
-        path, debug_override, optimization=f"jaxtyping6{typechecker_hash}"
+        path, debug_override, optimization=f"jaxtyping7{typechecker_hash}"
     )
 
 
@@ -88,10 +90,56 @@ def _dot_lookup(*elements):
     return out
 
 
-def _str_lookup(string):
-    module = ast.parse(string)
-    (expr,) = module.body
-    return expr.value
+def _get_hash(string):
+    if string is None:
+        return 0
+    if callable(string):
+        return _get_hash(getsource(string))
+    return str(hashlib.md5(string.encode("utf-8")).hexdigest())
+
+
+_decorator_lookup = {}
+_decorator_ast_lookup = {}
+
+
+def _typechecker_to_ast(typechecker):
+    hash = _update_typechecker_decorator(typechecker)
+    _decorator_ast_lookup[hash] = (
+        ast.parse(
+            f"@jaxtyping._import_hook._decorator_lookup['{hash}']\n"
+            + "def _():\n    ..."
+        )
+        .body[0]
+        .decorator_list[0]
+    )
+
+    return _decorator_ast_lookup[hash]
+
+
+def _update_typechecker_decorator(typechecker):
+    hash = _get_hash(typechecker)
+    if hash in _decorator_lookup.keys():
+        return hash
+
+    if type(typechecker) == str:
+        # If the typechecker is a string, we make a decorator ourselves
+        # and pass it to lookup
+        string_to_eval = (
+            "def f(x, *args, **kwargs):\n"
+            + f"  import {typechecker.split('.', 1)[0]}\n"
+            + f"  return {typechecker}(x, *args, **kwargs)"
+        )
+        local_vars = {}
+        exec(string_to_eval, {}, local_vars)
+        _decorator_lookup[hash] = local_vars["f"]
+    elif callable(typechecker):
+        # If the typechecker is a function, treat it as a decorator
+        _decorator_lookup[hash] = typechecker
+    else:
+        # If it is None, ignore it silently (use dummy decorator)
+        _decorator_lookup[hash] = lambda x, *_, **__: x
+
+    return hash
 
 
 class _JaxtypingTransformer(ast.NodeVisitor):
@@ -109,11 +157,6 @@ class _JaxtypingTransformer(ast.NodeVisitor):
                 continue  # module docstring
             else:
                 node.body.insert(i, ast.Import(names=[ast.alias("jaxtyping", None)]))
-                if self._typechecker is not None:
-                    typechecker_module, _ = self._typechecker.split(".", 1)
-                    node.body.insert(
-                        i, ast.Import(names=[ast.alias(typechecker_module, None)])
-                    )
                 break
 
         self._parents.append(node)
@@ -126,7 +169,7 @@ class _JaxtypingTransformer(ast.NodeVisitor):
         if self._typechecker is None:
             args = [ast.Constant(None)]
         else:
-            args = [_str_lookup(self._typechecker)]
+            args = [_typechecker_to_ast(self._typechecker)]
         node.decorator_list.insert(0, ast.Call(func, args, keywords=[]))
         self._parents.append(node)
         self.generic_visit(node)
@@ -155,7 +198,7 @@ class _JaxtypingTransformer(ast.NodeVisitor):
                 # Place at the end of the decorator list, as decorators
                 # frequently remove annotations from functions and we'd like to
                 # use those annotations.
-                node.decorator_list.append(_str_lookup(self._typechecker))
+                node.decorator_list.append(_typechecker_to_ast(self._typechecker))
         self._parents.append(node)
         self.generic_visit(node)
         self._parents.pop()
@@ -166,9 +209,7 @@ class _JaxtypingLoader(SourceFileLoader):
     def __init__(self, *args, typechecker, **kwargs):
         super().__init__(*args, **kwargs)
         self._typechecker = typechecker
-        self._typechecker_hash = hashlib.md5(
-            self._typechecker.encode("utf-8")
-        ).hexdigest()
+        self._typechecker_hash = _get_hash(self._typechecker)
 
     def source_to_code(self, data, path, *, _optimize=-1):
         source = decode_source(data)
@@ -385,6 +426,7 @@ def install_import_hook(modules: Union[str, Sequence[str]], typechecker: Optiona
     else:
         raise RuntimeError("Cannot find a PathFinder in sys.meta_path")
 
+    _update_typechecker_decorator(typechecker)
     hook = _JaxtypingFinder(modules, finder, typechecker)
     sys.meta_path.insert(0, hook)
     return ImportHookManager(hook)
