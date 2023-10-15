@@ -93,8 +93,39 @@ def _dot_lookup(*elements):
 class Typechecker:
     lookup = {}
 
-    def __init__(self, typechecker):
+    def __init__(self, typechecker, decorates_class_methods=None):
         self.ast = None
+
+        # We know that beartype likes class methods to not be decorated
+        # While typeguard likes them to be decorated
+        if decorates_class_methods is None:
+            if "typeguard.typechecked" in typechecker:
+                decorates_class_methods = True
+            if "beartype.beartype" in typechecker:
+                decorates_class_methods = False
+
+        if decorates_class_methods is None:
+            raise ValueError(
+                """
+                Since the typechecker you are using is neither 
+                'typeguard.typechecked' nor 'beartype.beartype', jaxtyping 
+                was not able to identify whether you want to decorate 
+                class methods or not. Please, specify the 
+                'decorates_class_methods' argument explicitly,
+                for example, like this:\n
+                install_import_hook('your module', 'your typechecker', 
+                decorates_class_methods=True)"""
+            )
+
+        if not isinstance(decorates_class_methods, bool):
+            raise ValueError(
+                "The 'decorates_class_methods' argument " "should always be a boolean."
+            )
+
+        # After all these checks we can safely assign the value
+        self.decorates_class_methods = decorates_class_methods
+
+        # Now, let's deal with the typechecker...
 
         if isinstance(typechecker, str):
             # If the typechecker is a string, then we parse it
@@ -164,14 +195,21 @@ class JaxtypingTransformer(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef):
         func = _dot_lookup("jaxtyping", "_decorator", "_jaxtyped_typechecker")
         node.decorator_list.insert(
-            0, ast.Call(func, [self._typechecker.get_ast()], keywords=[])
+            1, ast.Call(func, [self._typechecker.get_ast()], keywords=[])
         )
+        node.decorator_list.insert(0, self._typechecker.get_ast())
         self._parents.append(node)
-        self.generic_visit(node)
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef):
+                self.visit_FunctionDef(child, inside_typechecked_class=True)
+            else:
+                self.visit(child)
+        if node.name == "Mod2":
+            print(ast.unparse(node))
         self._parents.pop()
         return node
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):
+    def visit_FunctionDef(self, node: ast.FunctionDef, inside_typechecked_class=False):
         has_annotated_args = any(arg for arg in node.args.args if arg.annotation)
         has_annotated_return = bool(node.returns)
         if has_annotated_args or has_annotated_return:
@@ -192,7 +230,11 @@ class JaxtypingTransformer(ast.NodeVisitor):
             # Place typechecker at the end of the decorator list, as decorators
             # frequently remove annotations from functions and we'd like to
             # use those annotations.
-            node.decorator_list.append(self._typechecker.get_ast())
+            if (
+                self._typechecker.decorates_class_methods
+                or not inside_typechecked_class
+            ):
+                node.decorator_list.append(self._typechecker.get_ast())
 
         self._parents.append(node)
         self.generic_visit(node)
@@ -289,7 +331,11 @@ class ImportHookManager:
 
 # Deliberately no default for `typechecker` so that folks must opt-in to not having
 # a typechecker.
-def install_import_hook(modules: Union[str, Sequence[str]], typechecker: Optional[str]):
+def install_import_hook(
+    modules: Union[str, Sequence[str]],
+    typechecker: Optional[str],
+    decorates_class_methods: Optional[bool] = None,
+):
     """Automatically apply `@jaxtyped`, and optionally a type checker, as decorators.
 
     !!! Tip "Usage"
@@ -346,6 +392,9 @@ def install_import_hook(modules: Union[str, Sequence[str]], typechecker: Optiona
         string. For example `typechecker="typeguard.typechecked"`, or
         `typechecker="beartype.beartype"`. You may pass `typechecker=None` if you do not
         want to automatically decorate with a typechecker as well.
+    - `decorates_class_methods`: whether or not the typechecker you want to use prefers
+        to decorate class methods. For "beartype.beartype" and "typeguard.typechecked"
+        this parameter is chosen automatically.
 
     **Returns:**
 
@@ -442,7 +491,9 @@ def install_import_hook(modules: Union[str, Sequence[str]], typechecker: Optiona
     else:
         raise RuntimeError("Cannot find a PathFinder in sys.meta_path")
 
-    wrapped_typechecker = Typechecker(typechecker)
+    wrapped_typechecker = Typechecker(
+        typechecker, decorates_class_methods=decorates_class_methods
+    )
     hook = _JaxtypingFinder(modules, finder, wrapped_typechecker)
     sys.meta_path.insert(0, hook)
     return ImportHookManager(hook)

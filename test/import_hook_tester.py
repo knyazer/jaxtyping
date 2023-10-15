@@ -229,6 +229,19 @@ Bar(Foo, Foo, Foo)
 with pytest.raises(ParamError):
     Bar(1, Foo, Foo)
 
+
+#
+# Test that typing_extensions.Self works
+#
+"""
+class Cat(eqx.Module):
+
+    def f(self, another_cat: Self) -> int:
+        return 123
+
+Cat().f(Cat())
+"""
+
 # Record that we've finished our checks successfully
 
 jaxtyping._test_import_hook_counter += 1
